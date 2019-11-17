@@ -1,0 +1,138 @@
+---
+title: "Bear Movement"
+output:
+  html_document:
+    df_print: paged
+  html_notebook:
+    code_folding: hide
+---
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+packages<-c("adehabitatHR","data.table","ggfortify","grid","move","moveVis","OpenStreetMap","pbapply","plotly","rgdal","sp","tidyverse","viridis")
+sapply(packages, require, character.only=T)
+
+library(readr)
+BrownBear <- read_csv("Brown bear Slovenia 1993-1999.csv")
+colnames(BrownBear) <- c("event.id", "visible", "timestamp", "location.long", "location.lat", "behavioural.class", "comments", "location.error", "sensor.type", "ind.taxon.name", "individual.local.identifier", "tag.local.identifier2", "study.name", "utm.easting", "utm.northing", "utm.zone")
+head(BrownBear)
+```
+
+Making the qaqc plots to check and see if everything is distributed well
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+qaqc_plot <- ggplot() + geom_point(data=BrownBear, 
+                                   aes(BrownBear$utm.easting,BrownBear$utm.northing,
+                                       color=BrownBear$individual.local.identifier)) +
+  labs(x="Easting", y="Northing") +
+  guides(color=guide_legend("Identifier"))
+
+ggplotly(qaqc_plot)
+
+```
+
+Making of the Ancka and nejc smaller datasets, and then plotting again but with only UrsaMinor
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+UrsaMinor<-BrownBear %>% slice(1:351, 1225:1341)
+qaqc_plot <- ggplot() + geom_point(data=UrsaMinor, 
+                                   aes(UrsaMinor$utm.easting,UrsaMinor$utm.northing,
+                                       color=UrsaMinor$individual.local.identifier)) +
+  labs(x="Easting", y="Northing") +
+  guides(color=guide_legend("Identifier"))
+
+ggplotly(qaqc_plot)
+```
+
+Now make it into two separate folders for the function to work
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+lapply(split(UrsaMinor, UrsaMinor$individual.local.identifier), 
+       function(x)write.csv(x, file = paste(x$individual.local.identifier[1],".csv"), row.names = FALSE))
+
+files <- c("ancka .csv", "nejc .csv")
+
+```
+Conversions of Lat/Long to UTM and back again with plotting
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+utm_points <- cbind(UrsaMinor$utm.easting, UrsaMinor$utm.northing)
+utm_locations <- SpatialPoints(utm_points, 
+                               proj4string=CRS("+proj=utm +zone=33 +datum=WGS84"))
+proj_lat.lon <- as.data.frame(spTransform(
+  utm_locations, CRS("+proj=longlat +datum=WGS84")))
+colnames(proj_lat.lon) <- c("x","y")
+raster <- openmap(c(max(proj_lat.lon$y)+0.01, min(proj_lat.lon$x)-0.01), 
+                  c(min(proj_lat.lon$y)-0.01, max(proj_lat.lon$x)+0.01), 
+                  type = "bing")
+raster_utm <- openproj(raster, 
+                       projection = "+proj=utm +zone=33 +ellps=WGS84 +units=m +no_defs")
+
+autoplot(raster_utm, expand = TRUE) + theme_bw() +
+  theme(legend.position="bottom") +
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+  geom_point(data=UrsaMinor, aes(utm.easting,utm.northing,
+                                 color=individual.local.identifier), size = 3, alpha = 0.8) +
+  theme(axis.title = element_text(face="bold")) + labs(x="Easting", y="Northing") + guides(color=guide_legend("Identifier"))
+                          
+```
+Minimum convex ploygons! :3
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+mcp_raster <- function(filename){
+  data <- read.csv(file = filename)
+  x <- as.data.frame(data$utm.easting)
+  y <- as.data.frame(data$utm.northing)
+  xy <- c(x,y)
+  data.proj <- SpatialPointsDataFrame(xy,data, proj4string = CRS("+proj=utm +zone=33 +ellps=WGS84 +units=m +no_defs"))
+  xy <- SpatialPoints(data.proj@coords)
+  mcp.out <- mcp(xy, percent=100, unout="ha")
+  mcp.points <- cbind((data.frame(xy)),data$individual.local.identifier)
+  colnames(mcp.points) <- c("x","y", "identifier")
+  mcp.poly <- fortify(mcp.out, region = "id")
+  units <- grid.text(paste(round(mcp.out@data$area,2),"ha"), x=0.85,  y=0.95,
+                     gp=gpar(fontface=4, col="white", cex=0.9), draw = FALSE)
+  mcp.plot <- autoplot(raster_utm, expand = TRUE) + theme_bw() + theme(legend.position="none") +
+    theme(panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+    geom_polygon(data=mcp.poly, aes(x=mcp.poly$long, y=mcp.poly$lat), alpha=0.8) +
+    geom_point(data=mcp.points, aes(x=x, y=y)) + 
+    labs(x="Easting (m)", y="Northing (m)", title=mcp.points$identifier) +
+    theme(legend.position="none", plot.title = element_text(face = "bold", hjust = 0.5)) + 
+    annotation_custom(units)
+  mcp.plot
+}
+
+pblapply(files, mcp_raster)
+
+```
+Now that we have these convex polygons, we want to adjust and get a more accurate read of the area and hone it in so to speak with a KDE
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+kde_raster <- function(filename){
+  data <- read.csv(file = filename)
+  x <- as.data.frame(data$utm.easting)
+  y <- as.data.frame(data$utm.northing)
+  xy <- c(x,y)
+  data.proj <- SpatialPointsDataFrame(xy,data, proj4string = CRS("+proj=utm +zone=33 +ellps=WGS84 +units=m +no_defs"))
+  xy <- SpatialPoints(data.proj@coords)
+  kde<-kernelUD(xy, h="href", kern="bivnorm", grid=100)
+  ver95 <- getverticeshr(kde, 95)
+  ver75 <- getverticeshr(kde, 75)
+  ver50 <- getverticeshr(kde, 50)
+  kde.points <- cbind((data.frame(data.proj@coords)),data$individual.local.identifier)
+  colnames(kde.points) <- c("x","y","identifier")
+  kde.poly95 <- fortify(ver95, region = "id")
+  kde.poly75<- fortify(ver75, region = "id")
+  kde.poly50<- fortify(ver50, region = "id")
+  units <- grid.text(paste(round(ver95$area,2)," ha"), x=0.85,  y=0.95,
+                     gp=gpar(fontface=4, col="white", cex=0.9), draw = FALSE)
+  kde.plot <- autoplot(raster_utm, expand = TRUE) + theme_bw() + theme(legend.position="none") +
+    theme(panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+    geom_polygon(data=kde.poly95, aes(x=kde.poly95$long, y=kde.poly95$lat),  fill="purple", alpha = 0.8) +
+    geom_polygon(data=kde.poly75, aes(x=kde.poly75$long, y=kde.poly75$lat),  fill="green", alpha = 0.8) +
+    geom_polygon(data=kde.poly50, aes(x=kde.poly50$long, y=kde.poly50$lat), fill="red", alpha = 0.8) +
+    geom_point(data=kde.points, aes(x=x, y=y)) +
+    labs(x="Easting (m)", y="Northing (m)", title=kde.points$identifier) +
+    theme(legend.position="none", plot.title = element_text(face = "bold", hjust = 0.5)) + 
+    annotation_custom(units)
+  kde.plot
+}
+
+pblapply(files, kde_raster)
+
+```
+
